@@ -11,6 +11,7 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.test.context.ActiveProfiles;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.util.UUID;
@@ -21,7 +22,7 @@ import java.util.UUID;
  *
  **/
 @SpringBootTest
-@org.springframework.test.context.ActiveProfiles("test")
+@ActiveProfiles("test")
 public class ExcelTagTest {
 
     @Autowired
@@ -35,7 +36,6 @@ public class ExcelTagTest {
     }
 
     @Test
-    @Transactional
     public void testGetOneNotExists() {
         QueryWrapper<Tag> queryWrapper = new QueryWrapper<>();
         queryWrapper.eq("tagName", uniqueTagName);
@@ -65,7 +65,6 @@ public class ExcelTagTest {
     }
 
     @Test
-    @Transactional
     public void testImportExcelWithListener() {
         // 读取 test_tag_excel.xlsx，通过 TagDataListener 逐行入库
         String fileName = "src/main/resources/test_tag_excel.xlsx";
