@@ -10,7 +10,7 @@ import org.springframework.stereotype.Component;
 import javax.annotation.Resource;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.*;
 
 /**
  * @description: 转JavaAgent开发加油!
@@ -27,12 +27,16 @@ public class ImportUsersConcurrent {
 
     @Resource
     private UserService userService;
-    private boolean alreadyExecuted = true;
+    private boolean alreadyExecuted = true;//导入数据改为true
+    //Cpu 密集型 ，分配的核心线程数 = CPU - 1
+    //Io 密集型 ，分配的核心线程数 = CPU * 2
+    private ExecutorService executorService = new ThreadPoolExecutor(60, 100, 10000, TimeUnit.MINUTES, new ArrayBlockingQueue<>(1000));
+
 
     /**
      * 一次性任务批量导入用户，1000w条数据进行真实模拟
      */
-    @Scheduled(cron = "0 0/1 * * * ?") // 每分钟触发一次
+    //@Scheduled(cron = "0 0/1 * * * ?") // 每分钟触发一次
     public void importUsers() {
         if (alreadyExecuted){
             return;
@@ -45,7 +49,7 @@ public class ImportUsersConcurrent {
 
         //10w条数据，每组1w条
         int j = 0;
-        for (int i = 0; i < 10; i++) {
+        for (int i = 0; i < 40; i++) {
 
             while (true){
                 j++;
@@ -66,11 +70,11 @@ public class ImportUsersConcurrent {
                 }
             }
             CompletableFuture<Void> future = CompletableFuture.runAsync(() -> {
-                userService.saveBatch(usersList, 10000);
-            });
+                userService.saveBatch(usersList, 1000);
+            },executorService);
             futureArrayList.add(future);
         }
-        CompletableFuture.allOf(futureArrayList.toArray(new CompletableFuture[0])).join();
+        CompletableFuture.allOf(futureArrayList.toArray(new CompletableFuture[]{})).join();
 
         stopWatch.stop();
         System.out.println("耗时：" + stopWatch.getTotalTimeMillis());

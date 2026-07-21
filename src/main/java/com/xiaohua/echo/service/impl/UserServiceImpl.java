@@ -14,17 +14,23 @@ import com.xiaohua.echo.service.EmailService;
 import com.xiaohua.echo.service.UserService;
 import com.xiaohua.echo.strategy.RegisterStrategy;
 import com.xiaohua.echo.strategy.RegisterStrategyFactory;
+import cn.hutool.json.JSONUtil;
 import com.xiaohua.echo.utils.AlgorithmUtils;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.commons.lang3.StringUtils;
 import org.apache.commons.math3.util.Pair;
+import org.springframework.data.redis.core.RedisCallback;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.util.CollectionUtils;
 import org.springframework.util.DigestUtils;
 import javax.annotation.Resource;
 import javax.servlet.http.HttpServletRequest;
+import java.nio.charset.StandardCharsets;
+import java.time.Duration;
 import java.util.*;
+import java.util.concurrent.ThreadLocalRandom;
+import java.util.concurrent.TimeUnit;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
@@ -287,6 +293,170 @@ public class UserServiceImpl extends ServiceImpl<UserMapper, User>
             finalUserList.add(userIdUserListMap.get(userId).get(0));
         }
         return finalUserList;
+    }
+
+    @Override
+    public List<User> recommendUsers(int pageNum, int pageSize, User currentUser) {
+        int gender = currentUser.getGender();
+        long currentUserId = currentUser.getId();
+        String zsetKey = "recommend:gender:" + gender;
+        int start = (pageNum - 1) * pageSize;
+        int end = start + pageSize - 1;
+
+        log.info("=== 开始推荐用户 === pageNum={}, pageSize={}, gender={}, currentUserId={}",
+                pageNum, pageSize, gender, currentUserId);
+        log.info("[步骤1] ZSET key={}, ZREVRANGE {} {}", zsetKey, start, end);
+
+        // 1. 从 ZSET 分页取 userId
+        long t1 = System.currentTimeMillis();
+        Set<String> userIdSet = stringRedisTemplate.opsForZSet()
+                .reverseRange(zsetKey, start, end);
+        long t2 = System.currentTimeMillis();
+
+        if (userIdSet == null || userIdSet.isEmpty()) {
+            log.info("[步骤1] ZSET 缓存未命中，耗时={}ms，准备重建...", t2 - t1);
+
+            // 2. ZSET 未命中 → DB 重建
+            long t3 = System.currentTimeMillis();
+            rebuildGenderZSet(zsetKey, gender, currentUserId);
+            long t4 = System.currentTimeMillis();
+            log.info("[步骤2] ZSET 重建完成，耗时={}ms", t4 - t3);
+
+            userIdSet = stringRedisTemplate.opsForZSet()
+                    .reverseRange(zsetKey, start, end);
+            log.info("[步骤2] 重建后重新查询，结果数量={}", userIdSet != null ? userIdSet.size() : 0);
+        } else {
+            log.info("[步骤1] ZSET 缓存命中，耗时={}ms，得到 {} 个 userId", t2 - t1, userIdSet.size());
+        }
+
+        if (userIdSet == null || userIdSet.isEmpty()) {
+            log.warn("[步骤2] 最终结果为空，返回空列表");
+            return Collections.emptyList();
+        }
+
+        // 3. 过滤掉当前用户
+        List<String> userIdList = userIdSet.stream()
+                .filter(id -> !id.equals(String.valueOf(currentUserId)))
+                .collect(Collectors.toList());
+        log.info("[步骤3] 过滤当前用户后，剩余 {} 个 userId（过滤掉 {} 个）",
+                userIdList.size(), userIdSet.size() - userIdList.size());
+
+        if (userIdList.isEmpty()) {
+            log.warn("[步骤3] 过滤后为空，返回空列表");
+            return Collections.emptyList();
+        }
+
+        // 4. 批量获取用户信息（MGET + 未命中查 DB 回填）
+        log.info("[步骤4] 开始批量获取用户信息，userIds={}", userIdList);
+        long t5 = System.currentTimeMillis();
+        List<User> result = fetchUserInfoBatch(userIdList);
+        long t6 = System.currentTimeMillis();
+        log.info("[步骤4] 批量获取完成，耗时={}ms，返回 {} 个用户", t6 - t5, result.size());
+
+        log.info("=== 推荐用户结束 ===");
+        return result;
+    }
+
+    /**
+     * 从 DB 重建 ZSET
+     */
+    private void rebuildGenderZSet(String zsetKey, int gender, long excludeUserId) {
+        log.info("  [重建ZSET] 从数据库查询 gender={} 的所有 userId（排除 {}）...", gender, excludeUserId);
+        long t1 = System.currentTimeMillis();
+        List<Object> idObjects = userMapper.selectObjs(
+                new QueryWrapper<User>()
+                        .select("id")
+                        .eq("gender", gender)
+                        .ne("id", excludeUserId)
+        );
+        long t2 = System.currentTimeMillis();
+        log.info("  [重建ZSET] DB查询完成，耗时={}ms，查到 {} 个用户", t2 - t1, idObjects.size());
+
+        if (CollectionUtils.isEmpty(idObjects)) {
+            log.warn("  [重建ZSET] 未查到任何用户，跳过");
+            return;
+        }
+
+        // 用 pipeline 批量写入 ZSET，随机 score 打散顺序
+        log.info("  [重建ZSET] 开始 pipeline 写入 Redis ZSET...");
+        long t3 = System.currentTimeMillis();
+        stringRedisTemplate.executePipelined((RedisCallback<Object>) connection -> {
+            byte[] keyBytes = zsetKey.getBytes(StandardCharsets.UTF_8);
+            for (Object obj : idObjects) {
+                Long id = (Long) obj;
+                double score = ThreadLocalRandom.current().nextDouble();
+                connection.zAdd(keyBytes, score,
+                        String.valueOf(id).getBytes(StandardCharsets.UTF_8));
+            }
+            return null;
+        });
+        long t4 = System.currentTimeMillis();
+        log.info("  [重建ZSET] pipeline 写入完成，耗时={}ms", t4 - t3);
+
+        stringRedisTemplate.expire(zsetKey, 10, TimeUnit.MINUTES);
+        log.info("  [重建ZSET] 设置过期时间 10 分钟，key={}", zsetKey);
+    }
+
+    /**
+     * 批量获取用户信息：先 MGET Redis，未命中查 DB 并回填
+     */
+    private List<User> fetchUserInfoBatch(List<String> userIdList) {
+        // 构建 cache key 列表
+        List<String> cacheKeys = userIdList.stream()
+                .map(id -> "user:info:" + id)
+                .collect(Collectors.toList());
+
+        // MGET 批量查
+        log.info("    [获取用户] MGET {} 个 key", cacheKeys.size());
+        long t1 = System.currentTimeMillis();
+        List<String> cachedJsonList = stringRedisTemplate.opsForValue().multiGet(cacheKeys);
+        long t2 = System.currentTimeMillis();
+        log.info("    [获取用户] MGET 完成，耗时={}ms", t2 - t1);
+
+        List<User> result = new ArrayList<>();
+        List<Long> missIds = new ArrayList<>();
+
+        int hitCount = 0;
+        for (int i = 0; i < userIdList.size(); i++) {
+            String json = cachedJsonList != null ? cachedJsonList.get(i) : null;
+            if (StringUtils.isNotBlank(json)) {
+                result.add(JSONUtil.toBean(json, User.class));
+                hitCount++;
+            } else {
+                missIds.add(Long.valueOf(userIdList.get(i)));
+            }
+        }
+        log.info("    [获取用户] 缓存命中={}，未命中={}", hitCount, missIds.size());
+
+        // 未命中 → 批量查 DB 并回填
+        if (!missIds.isEmpty()) {
+            log.info("    [获取用户] 批量查 DB，missIds={}", missIds);
+            long t3 = System.currentTimeMillis();
+            List<User> dbUsers = userMapper.selectBatchIds(missIds);
+            long t4 = System.currentTimeMillis();
+            log.info("    [获取用户] DB查询完成，耗时={}ms，查到 {} 个", t4 - t3, dbUsers.size());
+
+            if (!dbUsers.isEmpty()) {
+                log.info("    [获取用户] 开始 pipeline 回填缓存...");
+                long t5 = System.currentTimeMillis();
+                stringRedisTemplate.executePipelined((RedisCallback<Object>) connection -> {
+                    for (User user : dbUsers) {
+                        User safe = getSafetyUser(user);
+                        byte[] keyBytes = ("user:info:" + user.getId())
+                                .getBytes(StandardCharsets.UTF_8);
+                        byte[] valueBytes = JSONUtil.toJsonStr(safe)
+                                .getBytes(StandardCharsets.UTF_8);
+                        connection.setEx(keyBytes, Duration.ofMinutes(30).getSeconds(), valueBytes);
+                    }
+                    return null;
+                });
+                long t6 = System.currentTimeMillis();
+                log.info("    [获取用户] pipeline 回填完成，耗时={}ms", t6 - t5);
+
+                dbUsers.forEach(user -> result.add(getSafetyUser(user)));
+            }
+        }
+        return result;
     }
 
     /**

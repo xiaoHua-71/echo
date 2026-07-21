@@ -2,7 +2,6 @@ package com.xiaohua.echo.controller;
 
 import cn.hutool.json.JSONUtil;
 import com.baomidou.mybatisplus.core.conditions.query.QueryWrapper;
-import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
 import com.xiaohua.echo.common.BaseResponse;
 import com.xiaohua.echo.common.ErrorCode;
 import com.xiaohua.echo.common.ResultUtils;
@@ -118,23 +117,24 @@ public class UserController {
     }
 
     @GetMapping("/recommend")
-    public BaseResponse<List<User>> recommendUsers(HttpServletRequest request) {
-        log.info("request:{}",request);
+    public BaseResponse<List<User>> recommendUsers(
+            @RequestParam() int pageNum,
+            @RequestParam() int pageSize,
+            HttpServletRequest request) {
+        log.info(">>> Controller 收到推荐请求 pageNum={}, pageSize={}", pageNum, pageSize);
 
         Object userObj = request.getSession().getAttribute(USER_LOGIN_STATE);
         if (userObj == null) {
+            log.warn(">>> Controller 用户未登录");
             throw new BusinessException(ErrorCode.NOT_LOGIN);
         }
         User currentUser = (User) userObj;
-        log.info("currentUser:{}", JSONUtil.toJsonStr(currentUser));
+        log.info(">>> Controller 当前用户 id={}, gender={}", currentUser.getId(), currentUser.getGender());
 
-        QueryWrapper<User> queryWrapper = new QueryWrapper<>();
-        queryWrapper.eq("gender", currentUser.getGender());
-        List<User> userList = userService.list(queryWrapper);
-        List<User> list = userList.stream()
-                .filter(user -> !user.getId().equals(currentUser.getId()))
-                .map(user -> userService.getSafetyUser(user))
-                .collect(Collectors.toList());
+        long t1 = System.currentTimeMillis();
+        List<User> list = userService.recommendUsers(pageNum, pageSize, currentUser);
+        long t2 = System.currentTimeMillis();
+        log.info(">>> Controller 推荐完成，返回 {} 个用户，总耗时={}ms", list.size(), t2 - t1);
         return ResultUtils.success(list);
     }
 

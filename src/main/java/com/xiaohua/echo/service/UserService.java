@@ -98,4 +98,13 @@ public interface UserService extends IService<User> {
      * @return
      */
     List<User> matchUsers(long num, User loginUser);
+
+    /**
+     * 推荐用户（Redis 缓存）
+     * @param pageNum
+     * @param pageSize
+     * @param currentUser
+     * @return
+     */
+    List<User> recommendUsers(int pageNum, int pageSize, User currentUser);
 }

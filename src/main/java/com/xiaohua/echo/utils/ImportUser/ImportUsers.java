@@ -29,7 +29,7 @@ public class ImportUsers {
     /**
      * 一次性任务批量导入用户，1000w条数据进行真实模拟
      */
-    @Scheduled(cron = "0 0/1 * * * ?") // 每分钟触发一次
+    //@Scheduled(cron = "0 0/1 * * * ?") // 每分钟触发一次
     public void importUsers() {
         if (alreadyExecuted){
             return;
