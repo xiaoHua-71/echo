@@ -55,12 +55,14 @@ public interface UserService extends IService<User> {
     int userLogout(HttpServletRequest request);
 
     /**
-     * 根据标签搜索用户
+     * 根据标签搜索用户（Redis 缓存）
      *
      * @param tagNameList
+     * @param pageNum
+     * @param pageSize
      * @return
      */
-    List<User> searchUsersByTags(List<String> tagNameList);
+    List<User> searchUsersByTags(List<String> tagNameList, int pageNum, int pageSize);
 
     /**
      * 更新用户信息

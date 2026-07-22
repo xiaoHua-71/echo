@@ -158,36 +158,103 @@ public class UserServiceImpl extends ServiceImpl<UserMapper, User>
     }
 
     /**
-     * 根据标签搜索用户（内存过滤）
-     *
-     * @param tagNameList 用户要拥有的标签
-     * @return
+     * 根据标签搜索用户（Redis 缓存：倒排索引 ZSET）
      */
     @Override
-    public List<User> searchUsersByTags(List<String> tagNameList) {
+    public List<User> searchUsersByTags(List<String> tagNameList, int pageNum, int pageSize) {
         if (CollectionUtils.isEmpty(tagNameList)) {
             throw new BusinessException(ErrorCode.PARAMS_ERROR);
         }
-        // 查询所有有标签的用户，再在内存中过滤
-        QueryWrapper<User> queryWrapper = new QueryWrapper<>();
-        queryWrapper.isNotNull("tags");
-        //1、获取所有有标签的用户
-        List<User> userList = userMapper.selectList(queryWrapper);
-        //2、在内存中进行过滤
-        Gson gson = new Gson();//引用Gson将JSON字符串转为Java对象
+        log.info("=== 开始标签搜索 === tags={}, pageNum={}, pageSize={}", tagNameList, pageNum, pageSize);
 
-        return userList.stream().filter(
-                user -> {
-                    String userTags = user.getTags();
-                    if (StringUtils.isBlank(userTags)) {
-                        return false;
-                    }
-                    List<String> toUserTags = gson.fromJson(userTags, new TypeToken<List<String>>() {
-                    }.getType());
-                    return toUserTags.stream().anyMatch(tagNameList::contains);
-                })
-                .map(this::getSafetyUser)
-                .collect(Collectors.toList());
+        // 1. 确保每个 tag 的 ZSET 缓存存在（懒加载）
+        long t1 = System.currentTimeMillis();
+        for (String tagName : tagNameList) {
+            ensureTagZSet(tagName);
+        }
+        long t2 = System.currentTimeMillis();
+        log.info("[步骤1] 确保 tag ZSET 完成，耗时={}ms", t2 - t1);
+
+        int start = (pageNum - 1) * pageSize;
+        int end = start + pageSize - 1;
+
+        Set<String> userIdSet;
+        if (tagNameList.size() == 1) {
+            // 单个标签：直接 ZREVRANGE
+            String tagKey = "tag:" + tagNameList.get(0);
+            userIdSet = stringRedisTemplate.opsForZSet().reverseRange(tagKey, start, end);
+            log.info("[步骤2] 单标签查询，ZREVRANGE {} {} {}，结果={}", tagKey, start, end,
+                    userIdSet != null ? userIdSet.size() : 0);
+        } else {
+            // 多个标签：ZUNIONSTORE 合并
+            String tmpKey = "tmp:search:" + UUID.randomUUID().toString().replace("-", "");
+            List<String> tagKeys = tagNameList.stream().map(t -> "tag:" + t).collect(Collectors.toList());
+            log.info("[步骤2] 多标签 ZUNIONSTORE，keys={}, dest={}", tagKeys, tmpKey);
+
+            stringRedisTemplate.opsForZSet().unionAndStore(
+                    tagKeys.get(0),
+                    tagKeys.subList(1, tagKeys.size()),
+                    tmpKey
+            );
+            stringRedisTemplate.expire(tmpKey, 1, TimeUnit.MINUTES);
+
+            userIdSet = stringRedisTemplate.opsForZSet().reverseRange(tmpKey, start, end);
+            log.info("[步骤2] ZREVRANGE 临时key {} {} {}，结果={}", tmpKey, start, end,
+                    userIdSet != null ? userIdSet.size() : 0);
+
+            stringRedisTemplate.delete(tmpKey);
+        }
+
+        if (userIdSet == null || userIdSet.isEmpty()) {
+            log.warn("[步骤3] 无匹配用户");
+            return Collections.emptyList();
+        }
+
+        // 3. 复用 fetchUserInfoBatch 获取用户信息
+        List<String> userIdList = new ArrayList<>(userIdSet);
+        log.info("[步骤3] 获取用户信息，userIds={}", userIdList);
+        long t3 = System.currentTimeMillis();
+        List<User> result = fetchUserInfoBatch(userIdList);
+        long t4 = System.currentTimeMillis();
+        log.info("=== 标签搜索结束 === 返回 {} 个用户，总耗时={}ms", result.size(), t4 - t1);
+
+        return result;
+    }
+
+    /**
+     * 确保 tag ZSET 存在，不存在则从 DB 懒加载
+     */
+    private void ensureTagZSet(String tagName) {
+        String tagKey = "tag:" + tagName;
+        if (Boolean.TRUE.equals(stringRedisTemplate.hasKey(tagKey))) {
+            log.info("  [tag缓存] {} 已存在，跳过", tagKey);
+            return;
+        }
+        log.info("  [tag缓存] {} 不存在，从DB加载...", tagKey);
+        long t1 = System.currentTimeMillis();
+        List<Object> userIds = userMapper.selectObjs(
+                new QueryWrapper<User>()
+                        .select("id")
+                        .like("tags", tagName)
+        );
+        long t2 = System.currentTimeMillis();
+        log.info("  [tag缓存] DB查询完成，耗时={}ms，查到 {} 个用户", t2 - t1, userIds.size());
+
+        if (CollectionUtils.isEmpty(userIds)) {
+            // 占位：写一个空集合标记位，防止缓存穿透
+            return;
+        }
+
+        stringRedisTemplate.executePipelined((RedisCallback<Object>) connection -> {
+            byte[] keyBytes = tagKey.getBytes(StandardCharsets.UTF_8);
+            for (Object obj : userIds) {
+                Long id = (Long) obj;
+                connection.zAdd(keyBytes, 1, String.valueOf(id).getBytes(StandardCharsets.UTF_8));
+            }
+            return null;
+        });
+        stringRedisTemplate.expire(tagKey, 30, TimeUnit.MINUTES);
+        log.info("  [tag缓存] {} 写入完成，共 {} 个 member", tagKey, userIds.size());
     }
 
     @Override

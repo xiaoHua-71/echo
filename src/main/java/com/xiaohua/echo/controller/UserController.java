@@ -139,11 +139,18 @@ public class UserController {
     }
 
     @GetMapping("/search/tags")
-    public BaseResponse<List<User>> searchUsersByTags(@RequestParam(required = false) List<String> tagNameList) {
+    public BaseResponse<List<User>> searchUsersByTags(
+            @RequestParam(required = false) List<String> tagNameList,
+            @RequestParam(defaultValue = "1") int pageNum,
+            @RequestParam(defaultValue = "10") int pageSize) {
         if (CollectionUtils.isEmpty(tagNameList)) {
             throw new BusinessException(ErrorCode.PARAMS_ERROR);
         }
-        List<User> userList = userService.searchUsersByTags(tagNameList);
+        log.info(">>> Controller 标签搜索 tags={}, pageNum={}, pageSize={}", tagNameList, pageNum, pageSize);
+        long t1 = System.currentTimeMillis();
+        List<User> userList = userService.searchUsersByTags(tagNameList, pageNum, pageSize);
+        long t2 = System.currentTimeMillis();
+        log.info(">>> Controller 标签搜索完成，返回 {} 个用户，总耗时={}ms", userList.size(), t2 - t1);
         return ResultUtils.success(userList);
     }
 
